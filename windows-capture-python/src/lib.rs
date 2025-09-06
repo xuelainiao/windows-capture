@@ -3,6 +3,9 @@
 #![allow(clippy::redundant_pub_crate)]
 #![allow(clippy::multiple_crate_versions)] // Should update as soon as possible
 
+use pyo3::prelude::*;
+use pyo3::types::PyList;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,8 +22,6 @@ use ::windows_capture::settings::{
 };
 use ::windows_capture::window::Window;
 use pyo3::exceptions::PyException;
-use pyo3::prelude::*;
-use pyo3::types::PyList;
 
 /// Fastest Windows Screen Capture Library For Python 🔥.
 #[pymodule]
@@ -134,12 +135,13 @@ pub struct NativeWindowsCapture {
     dirty_region_settings: DirtyRegionSettings,
     monitor_index: Option<usize>,
     window_name: Option<String>,
+    window_hwnd: Option<isize>,
 }
 
 #[pymethods]
 impl NativeWindowsCapture {
     #[new]
-    #[pyo3(signature = (on_frame_arrived_callback, on_closed, cursor_capture=None, draw_border=None, secondary_window=None, minimum_update_interval=None, dirty_region=None, monitor_index=None, window_name=None))]
+    #[pyo3(signature = (on_frame_arrived_callback, on_closed, cursor_capture=None, draw_border=None, secondary_window=None, minimum_update_interval=None, dirty_region=None, monitor_index=None, window_name=None, window_hwnd=None))]
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -152,14 +154,24 @@ impl NativeWindowsCapture {
         dirty_region: Option<bool>,
         mut monitor_index: Option<usize>,
         window_name: Option<String>,
+        window_hwnd: Option<isize>,
     ) -> PyResult<Self> {
-        if window_name.is_some() && monitor_index.is_some() {
+        let param_count = [
+            window_hwnd.is_some(),
+            window_name.is_some(),
+            monitor_index.is_some(),
+        ]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+        if param_count > 1 {
             return Err(PyException::new_err(
-                "You can't specify both the monitor index and the window name",
+                "Only one of window_hwnd, window_name, or monitor_index can be specified",
             ));
         }
 
-        if window_name.is_none() && monitor_index.is_none() {
+        if window_hwnd.is_none() && window_name.is_none() && monitor_index.is_none() {
             monitor_index = Some(1);
         }
 
@@ -202,13 +214,36 @@ impl NativeWindowsCapture {
             dirty_region_settings,
             monitor_index,
             window_name,
+            window_hwnd,
         })
     }
 
     /// Start capture.
     #[inline]
     pub fn start(&mut self) -> PyResult<()> {
-        if self.window_name.is_some() {
+        if self.window_hwnd.is_some() {
+            let window = Window::from_raw_hwnd(self.window_hwnd.unwrap() as *mut std::ffi::c_void);
+
+            let settings = Settings::new(
+                window,
+                self.cursor_capture,
+                self.draw_border,
+                SecondaryWindowSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
+                DirtyRegionSettings::Default,
+                ColorFormat::Bgra8,
+                (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
+            );
+
+            match InnerNativeWindowsCapture::start(settings) {
+                Ok(()) => (),
+                Err(e) => {
+                    return Err(PyException::new_err(format!(
+                        "InnerNativeWindowsCapture::start threw an exception: {e}",
+                    )));
+                }
+            }
+        } else if self.window_name.is_some() {
             let window = match Window::from_contains_name(self.window_name.as_ref().unwrap()) {
                 Ok(window) => window,
                 Err(e) => {
@@ -272,7 +307,40 @@ impl NativeWindowsCapture {
     /// Start capture on a dedicated thread.
     #[inline]
     pub fn start_free_threaded(&mut self) -> PyResult<NativeCaptureControl> {
-        let capture_control = if self.window_name.is_some() {
+        let capture_control = if self.window_hwnd.is_some() {
+            let window = Window::from_raw_hwnd(self.window_hwnd.unwrap() as *mut std::ffi::c_void);
+
+            let settings = Settings::new(
+                window,
+                self.cursor_capture,
+                self.draw_border,
+                SecondaryWindowSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
+                DirtyRegionSettings::Default,
+                ColorFormat::Bgra8,
+                (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
+            );
+
+            let capture_control = match InnerNativeWindowsCapture::start_free_threaded(settings) {
+                Ok(capture_control) => capture_control,
+                Err(e) => {
+                    if let GraphicsCaptureApiError::FrameHandlerError(
+                        InnerNativeWindowsCaptureError::PythonError(ref e),
+                    ) = e
+                    {
+                        return Err(PyException::new_err(format!(
+                            "Capture session threw an exception: {e}",
+                        )));
+                    }
+
+                    return Err(PyException::new_err(format!(
+                        "Capture session threw an exception: {e}",
+                    )));
+                }
+            };
+
+            NativeCaptureControl::new(capture_control)
+        } else if self.window_name.is_some() {
             let window = match Window::from_contains_name(self.window_name.as_ref().unwrap()) {
                 Ok(window) => window,
                 Err(e) => {
@@ -324,9 +392,9 @@ impl NativeWindowsCapture {
                 monitor,
                 self.cursor_capture,
                 self.draw_border,
-                SecondaryWindowSettings::Default,
-                MinimumUpdateIntervalSettings::Default,
-                DirtyRegionSettings::Default,
+                self.secondary_window,
+                self.minimum_update_interval,
+                self.dirty_region_settings,
                 ColorFormat::Bgra8,
                 (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
             );
